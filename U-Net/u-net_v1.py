@@ -228,10 +228,15 @@ class HurricaneHeatmapDataset(Dataset):
 
         timestamp = pd.to_datetime(pds[self.time_name].values[time_index])
 
+        lat = np.asarray(pds[self.lat_name].values, dtype=np.float32)
+        lon = np.asarray(pds[self.lon_name].values, dtype=np.float32)
+
         metadata = {
             "year": int(year),
             "time_index": int(time_index),
             "timestamp": str(timestamp),
+            "lat": lat,
+            "lon": lon
         }
 
         if not self.cache_open_datasets:
@@ -612,12 +617,23 @@ def evaluate_model(
     out_dir: Path,
     threshold: float = 0.4,
     n_plot: int = 12,
+    selected_time_indices: Optional[Sequence[int]] = None,
+    selected_timestamps: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     model.eval()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
     plotted = 0
+
+    selected_time_indices = (
+        None if not selected_time_indices else set(int(x) for x in selected_time_indices)
+    )
+    selected_timestamps = (
+        None if not selected_timestamps
+        else set(str(pd.Timestamp(x)) for x in selected_timestamps)
+    )
+
 
     for batch_idx, (x, y, meta) in enumerate(loader):
         x = x.to(device)
@@ -657,25 +673,59 @@ def evaluate_model(
             }
             rows.append(row)
 
-            if plotted < n_plot:
+            timestamp_str = str(meta["timestamp"][i])
+
+            plot_this = False
+            if selected_time_indices is None and selected_timestamps is None:
+                plot_this = plotted < n_plot
+            else:
+                if selected_time_indices is not None and time_index_val in selected_time_indices:
+                    plot_this = True
+                if selected_timestamps is not None and str(pd.Timestamp(timestamp_str)) in selected_timestamps:
+                    plot_this = True
+
+            if plot_this:
                 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-                im0 = axes[0].imshow(x_i, origin="lower")
+                lat_i = meta["lat"][i]
+                lon_i = meta["lon"][i]
+
+                if torch.is_tensor(lat_i):
+                    lat = lat_i.cpu().numpy()
+                else:
+                    lat = np.asarray(lat_i)
+
+                if torch.is_tensor(lon_i):
+                    lon = lon_i.cpu().numpy()
+                else:
+                    lon = np.asarray(lon_i)
+
+                origin = "lower" if lat[0] < lat[-1] else "upper"
+                extent = [float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max())]
+
+                im0 = axes[0].imshow(x_i, origin=origin, extent=extent, aspect="auto")
                 axes[0].set_title("Input PRMSL, normalized")
+                axes[0].set_xlabel("Longitude")
+                axes[0].set_ylabel("Latitude")
                 plt.colorbar(im0, ax=axes[0], fraction=0.046)
 
-                im1 = axes[1].imshow(targ_i, origin="lower", vmin=0, vmax=1)
+                im1 = axes[1].imshow(targ_i, origin=origin, extent=extent, vmin=0, vmax=1, aspect="auto")
                 axes[1].set_title("Target Gaussian label")
+                axes[1].set_xlabel("Longitude")
+                axes[1].set_ylabel("Latitude")
                 plt.colorbar(im1, ax=axes[1], fraction=0.046)
 
-                im2 = axes[2].imshow(pred_i, origin="lower", vmin=0, vmax=1)
+                im2 = axes[2].imshow(pred_i, origin=origin, extent=extent, vmin=0, vmax=1, aspect="auto")
                 axes[2].set_title("Predicted heatmap")
+                axes[2].set_xlabel("Longitude")
+                axes[2].set_ylabel("Latitude")
                 plt.colorbar(im2, ax=axes[2], fraction=0.046)
 
-                fig.suptitle(str(meta["timestamp"][i]))
+                fig.suptitle(timestamp_str)
                 fig.tight_layout()
 
-                fig_path = out_dir / f"diagnostic_{plotted:03d}.png"
+                safe_ts = pd.Timestamp(timestamp_str).strftime("%Y%m%d_%H%M%S")
+                fig_path = out_dir / f"diagnostic_{safe_ts}_t{time_index_val:04d}.png"
                 fig.savefig(fig_path, dpi=150)
                 plt.close(fig)
 
@@ -769,6 +819,16 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=0.4)
     parser.add_argument("--min-peak-distance", type=int, default=3)
+
+    parser.add_argument("--skip-training", action="store_true")
+    parser.add_argument("--checkpoint", default=None)
+
+    parser.add_argument("--diag-split", choices=["val", "test"], default="test")
+    parser.add_argument("--diag-n-plot", type=int, default=12)
+
+    parser.add_argument("--diag-time-indices", nargs="*", type=int, default=None)
+    parser.add_argument("--diag-timestamps", nargs="*", default=None)
+
 
     parser.add_argument("--out-dir", default="unet_outputs")
     parser.add_argument("--seed", type=int, default=42)
@@ -914,88 +974,100 @@ def main() -> None:
     best_val_loss = float("inf")
     best_model_path = out_dir / "best_model.pt"
 
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = run_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            loss_name=args.loss,
-            pos_weight=args.pos_weight,
-        )
+    if args.skip_training:
+        ckpt_path = Path(args.checkpoint) if args.checkpoint else best_model_path
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        if len(val_ds) > 0:
-            val_metrics = run_one_epoch(
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(
+            f"Loaded checkpoint from {ckpt_path} "
+            f"(epoch={checkpoint.get('epoch', 'NA')}, "
+            f"val_loss={checkpoint.get('val_loss', 'NA')})"
+        )
+    else:
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = run_one_epoch(
                 model,
-                val_loader,
-                optimizer=None,
-                device=device,
+                train_loader,
+                optimizer,
+                device,
                 loss_name=args.loss,
                 pos_weight=args.pos_weight,
             )
-        else:
-            val_metrics = {"loss": np.nan, "soft_dice": np.nan}
 
-        row = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_soft_dice": train_metrics["soft_dice"],
-            "val_loss": val_metrics["loss"],
-            "val_soft_dice": val_metrics["soft_dice"],
-        }
-        history.append(row)
+            if len(val_ds) > 0:
+                val_metrics = run_one_epoch(
+                    model,
+                    val_loader,
+                    optimizer=None,
+                    device=device,
+                    loss_name=args.loss,
+                    pos_weight=args.pos_weight,
+                )
+            else:
+                val_metrics = {"loss": np.nan, "soft_dice": np.nan}
 
-        train_loss_str = f"{row['train_loss']:.6f}" if np.isfinite(row['train_loss']) else "nan"
-        train_dice_str = f"{row['train_soft_dice']:.4f}" if np.isfinite(row['train_soft_dice']) else "nan"
-        val_loss_str = f"{row['val_loss']:.6f}" if np.isfinite(row['val_loss']) else "nan"
-        val_dice_str = f"{row['val_soft_dice']:.4f}" if np.isfinite(row['val_soft_dice']) else "nan"
+            row = {
+                "epoch": epoch,
+                "train_loss": train_metrics["loss"],
+                "train_soft_dice": train_metrics["soft_dice"],
+                "val_loss": val_metrics["loss"],
+                "val_soft_dice": val_metrics["soft_dice"],
+            }
+            history.append(row)
 
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train_loss={train_loss_str}, "
-            f"train_dice={train_dice_str}, "
-            f"val_loss={val_loss_str}, "
-            f"val_dice={val_dice_str}"
-        )
+            train_loss_str = f"{row['train_loss']:.6f}" if np.isfinite(row['train_loss']) else "nan"
+            train_dice_str = f"{row['train_soft_dice']:.4f}" if np.isfinite(row['train_soft_dice']) else "nan"
+            val_loss_str = f"{row['val_loss']:.6f}" if np.isfinite(row['val_loss']) else "nan"
+            val_dice_str = f"{row['val_soft_dice']:.4f}" if np.isfinite(row['val_soft_dice']) else "nan"
 
-        current_val_loss = row["val_loss"]
-        if np.isfinite(current_val_loss) and current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "config": config,
-                    "epoch": epoch,
-                    "val_loss": best_val_loss,
-                },
-                best_model_path,
+            print(
+                f"Epoch {epoch:03d} | "
+                f"train_loss={train_loss_str}, "
+                f"train_dice={train_dice_str}, "
+                f"val_loss={val_loss_str}, "
+                f"val_dice={val_dice_str}"
             )
 
-    history_df = pd.DataFrame(history)
-    history_df.to_csv(out_dir / "training_history.csv", index=False)
+            current_val_loss = row["val_loss"]
+            if np.isfinite(current_val_loss) and current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": config,
+                        "epoch": epoch,
+                        "val_loss": best_val_loss,
+                    },
+                    best_model_path,
+                )
 
-    # Plot training curves.
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        history_df = pd.DataFrame(history)
+        history_df.to_csv(out_dir / "training_history.csv", index=False)
 
-    axes[0].plot(history_df["epoch"], history_df["train_loss"], label="train")
-    if history_df["val_loss"].notna().any():
-        axes[0].plot(history_df["epoch"], history_df["val_loss"], label="validation")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].set_title("Training loss")
-    axes[0].legend()
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
-    axes[1].plot(history_df["epoch"], history_df["train_soft_dice"], label="train")
-    if history_df["val_soft_dice"].notna().any():
-        axes[1].plot(history_df["epoch"], history_df["val_soft_dice"], label="validation")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Soft Dice")
-    axes[1].set_title("Soft Dice diagnostic")
-    axes[1].legend()
+        axes[0].plot(history_df["epoch"], history_df["train_loss"], label="train")
+        if history_df["val_loss"].notna().any():
+            axes[0].plot(history_df["epoch"], history_df["val_loss"], label="validation")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].set_title("Training loss")
+        axes[0].legend()
 
-    fig.tight_layout()
-    fig.savefig(out_dir / "training_curves.png", dpi=150)
-    plt.close(fig)
+        axes[1].plot(history_df["epoch"], history_df["train_soft_dice"], label="train")
+        if history_df["val_soft_dice"].notna().any():
+            axes[1].plot(history_df["epoch"], history_df["val_soft_dice"], label="validation")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Soft Dice")
+        axes[1].set_title("Soft Dice diagnostic")
+        axes[1].legend()
+
+        fig.tight_layout()
+        fig.savefig(out_dir / "training_curves.png", dpi=150)
+        plt.close(fig)
 
     # Load best model if available.
     if best_model_path.exists():
@@ -1017,40 +1089,83 @@ def main() -> None:
             out_dir / "final_model.pt",
         )
 
-    # Evaluation and diagnostics.
-    if len(val_ds) > 0:
-        print("Evaluating validation set...")
-        val_eval = evaluate_model(
-            model,
-            val_loader,
-            device,
-            out_dir / "val_diagnostics",
-            threshold=args.threshold,
-        )
-        with pd.option_context("display.max_columns", None, "display.width", 200):
-            print(val_eval.describe(include="all"))
+    # Load best model after training only.
+    if not args.skip_training:
+        if best_model_path.exists():
+            checkpoint = torch.load(best_model_path, map_location=device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            print(
+                f"Loaded best model from epoch {checkpoint['epoch']} "
+                f"with val_loss={checkpoint['val_loss']:.6f}"
+            )
+        else:
+            # If no validation set was available, save final model.
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": config,
+                    "epoch": args.epochs,
+                    "val_loss": np.nan,
+                },
+                out_dir / "final_model.pt",
+            )
 
-    if len(test_ds) > 0:
-        print("Evaluating test set...")
-        test_eval = evaluate_model(
-            model,
-            test_loader,
-            device,
-            out_dir / "test_diagnostics",
-            threshold=args.threshold,
-        )
-        with pd.option_context("display.max_columns", None, "display.width", 200):
-            print(test_eval.describe(include="all"))
+    # Diagnostics on selected split only.
+    if args.diag_split == "val":
+        if len(val_ds) == 0:
+            print("No validation samples available; skipping diagnostics.")
+        else:
+            print("Evaluating validation set...")
+            target_loader = val_loader
+            target_out_dir = out_dir / "val_diagnostics"
 
-        print("Exporting test detections...")
-        run_detection_export(
-            model,
-            test_ds,
-            device,
-            out_csv=out_dir / "test_peak_detections.csv",
-            threshold=args.threshold,
-            min_distance=args.min_peak_distance,
-        )
+            diag_df = evaluate_model(
+                model,
+                target_loader,
+                device,
+                target_out_dir,
+                threshold=args.threshold,
+                n_plot=args.diag_n_plot,
+                selected_time_indices=args.diag_time_indices,
+                selected_timestamps=args.diag_timestamps,
+            )
+            print(diag_df.head())
+
+            with pd.option_context("display.max_columns", None, "display.width", 200):
+                print(diag_df.describe(include="all"))
+
+    else:  # test
+        if len(test_ds) == 0:
+            print("No test samples available; skipping diagnostics.")
+        else:
+            print("Evaluating test set...")
+            target_loader = test_loader
+            target_out_dir = out_dir / "test_diagnostics"
+
+            diag_df = evaluate_model(
+                model,
+                target_loader,
+                device,
+                target_out_dir,
+                threshold=args.threshold,
+                n_plot=args.diag_n_plot,
+                selected_time_indices=args.diag_time_indices,
+                selected_timestamps=args.diag_timestamps,
+            )
+            print(diag_df.head())
+
+            with pd.option_context("display.max_columns", None, "display.width", 200):
+                print(diag_df.describe(include="all"))
+
+            print("Exporting test detections...")
+            run_detection_export(
+                model,
+                test_ds,
+                device,
+                out_csv=out_dir / "peak_detections.csv",
+                threshold=args.threshold,
+                min_distance=args.min_peak_distance,
+            )
 
     train_ds.close()
     val_ds.close()
